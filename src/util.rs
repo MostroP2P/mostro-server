@@ -2,30 +2,33 @@ use crate::app::rate_user::get_user_reputation;
 use crate::bitcoin_price::BitcoinPriceManager;
 use crate::cli::settings::Settings;
 use crate::db;
-use crate::error::MostroError;
 use crate::flow;
 use crate::lightning;
+use crate::lightning::invoice::is_valid_invoice;
 use crate::lightning::LndConnector;
 use crate::messages;
 use crate::models::Yadio;
 use crate::nip33::{new_event, order_to_tags};
+use crate::MESSAGE_QUEUES;
 use crate::NOSTR_CLIENT;
 
 use anyhow::{Context, Error, Result};
 use chrono::Duration;
-use mostro_core::message::CantDoReason;
+use mostro_core::error::CantDoReason;
+use mostro_core::error::MostroError::{self, *};
+use mostro_core::error::ServiceError;
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Kind as OrderKind, Order, SmallOrder, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
+use sqlx::Pool;
+use sqlx::Sqlite;
 use sqlx::SqlitePool;
 use sqlx_crud::Crud;
 use std::fmt::Write;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc::channel;
-use tokio::sync::Mutex;
 // use fedimint_tonic_lnd::Client;
 use fedimint_tonic_lnd::lnrpc::invoice::InvoiceState;
 use std::collections::HashMap;
@@ -103,22 +106,28 @@ pub async fn get_market_quote(
 
     // Case no answers from Yadio
     if no_answer_api {
-        return Err(MostroError::NoAPIResponse);
+        return Err(MostroError::MostroInternalErr(ServiceError::NoAPIResponse));
     }
 
     // No currency present
     if !req.1 {
-        return Err(MostroError::NoCurrency);
+        return Err(MostroError::MostroInternalErr(ServiceError::NoCurrency));
     }
 
     if req.0.is_none() {
-        return Err(MostroError::MalformedAPIRes);
+        return Err(MostroError::MostroInternalErr(
+            ServiceError::MalformedAPIRes,
+        ));
     }
 
     let quote = if let Some(q) = req.0 {
-        q.json::<Yadio>().await?
+        q.json::<Yadio>()
+            .await
+            .map_err(|_| MostroError::MostroInternalErr(ServiceError::MessageSerializationError))?
     } else {
-        return Err(MostroError::MalformedAPIRes);
+        return Err(MostroError::MostroInternalErr(
+            ServiceError::MalformedAPIRes,
+        ));
     };
 
     let mut sats = quote.result * 100_000_000_f64;
@@ -166,7 +175,7 @@ pub async fn publish_order(
     trade_pubkey: PublicKey,
     request_id: Option<u64>,
     trade_index: Option<i64>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
     // Prepare a new default order
     let new_order_db = match prepare_new_order(
         new_order,
@@ -177,14 +186,18 @@ pub async fn publish_order(
     )
     .await
     {
-        Some(order) => order,
-        None => {
-            return Ok(());
+        Ok(order) => order,
+        Err(e) => {
+            return Err(e);
         }
     };
 
     // CRUD order creation
-    let mut order = new_order_db.clone().create(pool).await?;
+    let mut order = new_order_db
+        .clone()
+        .create(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let order_id = order.id;
     info!("New order saved Id: {}", order_id);
     // Get user reputation
@@ -192,23 +205,27 @@ pub async fn publish_order(
     // We transform the order fields to tags to use in the event
     let tags = order_to_tags(&new_order_db, reputation);
     // nip33 kind with order fields as tags and order id as identifier
-    let event = new_event(keys, "", order_id.to_string(), tags)?;
+    let event = new_event(keys, "", order_id.to_string(), tags)
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
     info!("Order event to be published: {event:#?}");
     let event_id = event.id.to_string();
     info!("Publishing Event Id: {event_id} for Order Id: {order_id}");
     // We update the order with the new event_id
     order.event_id = event_id;
-    order.update(pool).await?;
+    order
+        .update(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
     let mut order = new_order_db.as_new_order();
     order.id = Some(order_id);
 
     // Send message as ack with small order
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order_id),
         Action::NewOrder,
         Some(Payload::Order(order)),
-        &trade_pubkey,
+        trade_pubkey,
         trade_index,
     )
     .await;
@@ -219,7 +236,7 @@ pub async fn publish_order(
         .send_event(event)
         .await
         .map(|_s| ())
-        .map_err(|err| err.into())
+        .map_err(|err| MostroInternalErr(ServiceError::NostrError(err.to_string())))
 }
 
 async fn prepare_new_order(
@@ -228,7 +245,7 @@ async fn prepare_new_order(
     trade_index: Option<i64>,
     identity_pubkey: PublicKey,
     trade_pubkey: PublicKey,
-) -> Option<Order> {
+) -> Result<Order, MostroError> {
     let mut fee = 0;
     if new_order.amount > 0 {
         fee = get_fee(new_order.amount);
@@ -271,24 +288,17 @@ async fn prepare_new_order(
             new_order_db.trade_index_seller = trade_index;
         }
         None => {
-            send_cant_do_msg(
-                None,
-                None,
-                Some(CantDoReason::InvalidOrderKind),
-                &trade_pubkey,
-            )
-            .await;
-            return None;
+            return Err(MostroCantDo(CantDoReason::InvalidOrderKind));
         }
     }
 
     // Request price from API in case amount is 0
     new_order_db.price_from_api = new_order.amount == 0;
-    Some(new_order_db)
+    Ok(new_order_db)
 }
 
 pub async fn send_dm(
-    receiver_pubkey: &PublicKey,
+    receiver_pubkey: PublicKey,
     sender_keys: Keys,
     payload: String,
     expiration: Option<Timestamp>,
@@ -313,7 +323,7 @@ pub async fn send_dm(
     }
     let tags = Tags::new(tags);
 
-    let event = EventBuilder::gift_wrap(&sender_keys, receiver_pubkey, rumor, tags).await?;
+    let event = EventBuilder::gift_wrap(&sender_keys, &receiver_pubkey, rumor, tags).await?;
     info!(
         "Sending DM, Event ID: {} with payload: {:#?}",
         event.id, payload
@@ -346,19 +356,14 @@ pub async fn update_user_rating_event(
     buyer_sent_rate: bool,
     seller_sent_rate: bool,
     tags: Tags,
-    order_id: Uuid,
+    msg: &Message,
     keys: &Keys,
     pool: &SqlitePool,
-    rate_list: Arc<Mutex<Vec<Event>>>,
 ) -> Result<()> {
-    // Get order from id
-    let mut order = match Order::by_id(pool, order_id).await? {
-        Some(order) => order,
-        None => {
-            error!("Order Id {order_id} not found!");
-            return Ok(());
-        }
-    }; // nip33 kind with user as identifier
+    // Get order from msg
+    let mut order = get_order(msg, pool).await?;
+
+    // nip33 kind with user as identifier
     let event = new_event(keys, "", user.to_string(), tags)?;
     info!("Sending replaceable event: {event:#?}");
     // We update the order vote status
@@ -371,8 +376,13 @@ pub async fn update_user_rating_event(
     order.update(pool).await?;
 
     // Add event message to global list
-    rate_list.lock().await.push(event);
-
+    MESSAGE_QUEUES
+        .write()
+        .await
+        .queue_order_rate
+        .lock()
+        .await
+        .push(event);
     Ok(())
 }
 
@@ -475,7 +485,7 @@ pub async fn show_hold_invoice(
     let mut new_order = order.as_new_order();
     new_order.status = Some(Status::WaitingPayment);
     // We create a Message to send the hold invoice to seller
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::PayInvoice,
@@ -484,17 +494,17 @@ pub async fn show_hold_invoice(
             invoice_response.payment_request,
             None,
         )),
-        seller_pubkey,
+        *seller_pubkey,
         order.trade_index_seller,
     )
     .await;
     // We send a message to buyer to know that seller was requested to pay the invoice
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::WaitingSellerToPay,
         None,
-        buyer_pubkey,
+        *buyer_pubkey,
         order.trade_index_buyer,
     )
     .await;
@@ -514,7 +524,7 @@ pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> anyhow
             let _ = ln_client_invoices
                 .subscribe_invoice(hash, tx)
                 .await
-                .map_err(|e| MostroError::LnNodeError(e.to_string()));
+                .map_err(|e| e.to_string());
         }
     };
     tokio::spawn(invoice_task);
@@ -593,17 +603,48 @@ pub async fn set_waiting_invoice_status(
         None,
     );
     // We create a Message
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::AddInvoice,
         Some(Payload::Order(order_data)),
-        &buyer_pubkey,
+        buyer_pubkey,
         order.trade_index_buyer,
     )
     .await;
-
     Ok(order.amount)
+}
+
+/// Send message to buyer and seller to vote for counterpart
+pub async fn rate_counterpart(
+    buyer_pubkey: &PublicKey,
+    seller_pubkey: &PublicKey,
+    order: &Order,
+    request_id: Option<u64>,
+) -> Result<()> {
+    // Send dm to counterparts
+    // to buyer
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Rate,
+        None,
+        *buyer_pubkey,
+        None,
+    )
+    .await;
+    // to seller
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::Rate,
+        None,
+        *seller_pubkey,
+        None,
+    )
+    .await;
+
+    Ok(())
 }
 
 /// Settle a seller hold invoice
@@ -614,20 +655,17 @@ pub async fn settle_seller_hold_invoice(
     action: Action,
     is_admin: bool,
     order: &Order,
-    request_id: Option<u64>,
-) -> Result<()> {
+) -> Result<(), MostroError> {
+    // Get seller pubkey
+    let seller_pubkey = order
+        .get_seller_pubkey()
+        .map_err(|_| MostroCantDo(CantDoReason::InvalidPubkey))?
+        .to_string();
+    // Get sender pubkey
+    let sender_pubkey = event.rumor.pubkey.to_string();
     // Check if the pubkey is right
-    if !is_admin
-        && event.rumor.pubkey.to_string() != *order.seller_pubkey.as_ref().unwrap().to_string()
-    {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidPubkey),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Err(Error::msg("Not allowed"));
+    if !is_admin && sender_pubkey != seller_pubkey {
+        return Err(MostroCantDo(CantDoReason::InvalidPubkey));
     }
 
     // Settling the hold invoice
@@ -635,14 +673,7 @@ pub async fn settle_seller_hold_invoice(
         ln_client.settle_hold_invoice(preimage).await?;
         info!("{action}: Order Id {}: hold invoice settled", order.id);
     } else {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidInvoice),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Err(Error::msg("No preimage"));
+        return Err(MostroCantDo(CantDoReason::InvalidInvoice));
     }
     Ok(())
 }
@@ -654,34 +685,40 @@ pub fn bytes_to_string(bytes: &[u8]) -> String {
     })
 }
 
-pub async fn send_cant_do_msg(
+pub async fn enqueue_cant_do_msg(
     request_id: Option<u64>,
     order_id: Option<Uuid>,
-    reason: Option<CantDoReason>,
-    destination_key: &PublicKey,
+    reason: CantDoReason,
+    destination_key: PublicKey,
 ) {
     // Send message to event creator
-    let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(reason)));
-    if let Ok(message) = message.as_json() {
-        let sender_keys = crate::util::get_keys().unwrap();
-        let _ = send_dm(destination_key, sender_keys, message, None).await;
-    }
+    let message = Message::cant_do(order_id, request_id, Some(Payload::CantDo(Some(reason))));
+    MESSAGE_QUEUES
+        .write()
+        .await
+        .queue_order_cantdo
+        .lock()
+        .await
+        .push((message, destination_key));
 }
 
-pub async fn send_new_order_msg(
+pub async fn enqueue_order_msg(
     request_id: Option<u64>,
     order_id: Option<Uuid>,
     action: Action,
     payload: Option<Payload>,
-    destination_key: &PublicKey,
+    destination_key: PublicKey,
     trade_index: Option<i64>,
 ) {
     // Send message to event creator
     let message = Message::new_order(order_id, request_id, trade_index, action, payload);
-    if let Ok(message) = message.as_json() {
-        let sender_keys = crate::util::get_keys().unwrap();
-        let _ = send_dm(destination_key, sender_keys, message, None).await;
-    }
+    MESSAGE_QUEUES
+        .write()
+        .await
+        .queue_order_msg
+        .lock()
+        .await
+        .push((message, destination_key));
 }
 
 pub fn get_fiat_amount_requested(order: &Order, msg: &Message) -> Option<i64> {
@@ -719,6 +756,45 @@ pub async fn get_nostr_relays() -> Option<HashMap<RelayUrl, Relay>> {
     } else {
         None
     }
+}
+
+pub async fn get_order(msg: &Message, pool: &Pool<Sqlite>) -> Result<Order, MostroError> {
+    let order_msg = msg.get_inner_message_kind();
+    let order_id = order_msg
+        .id
+        .ok_or(MostroInternalErr(ServiceError::InvalidOrderId))?;
+    let order = Order::by_id(pool, order_id)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    if let Some(order) = order {
+        Ok(order)
+    } else {
+        Err(MostroInternalErr(ServiceError::InvalidOrderId))
+    }
+}
+
+pub async fn validate_invoice(msg: &Message, order: &Order) -> Result<Option<String>, MostroError> {
+    // init payment request to None
+    let mut payment_request = None;
+    // if payment request is present
+    if let Some(pr) = msg.get_inner_message_kind().get_payment_request() {
+        // if invoice is valid
+        if is_valid_invoice(
+            pr.clone(),
+            Some(order.amount as u64),
+            Some(order.fee as u64),
+        )
+        .await
+        .is_err()
+        {
+            return Err(MostroInternalErr(ServiceError::InvoiceInvalidError));
+        }
+        // if invoice is valid return it
+        else {
+            payment_request = Some(pr);
+        }
+    }
+    Ok(payment_request)
 }
 
 #[cfg(test)]
