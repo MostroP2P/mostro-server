@@ -3,13 +3,14 @@ use crate::db::{self};
 use crate::lightning::LndConnector;
 use crate::lnurl::resolv_ln_address;
 use crate::util::{
-    get_keys, get_nostr_client, send_cant_do_msg, send_new_order_msg, settle_seller_hold_invoice,
-    update_order_event,
+    enqueue_cant_do_msg, enqueue_order_msg, get_keys, get_order, rate_counterpart,
+    settle_seller_hold_invoice, update_order_event,
 };
 use anyhow::{Error, Result};
 use fedimint_tonic_lnd::lnrpc::payment::PaymentStatus;
 use lnurl::lightning_address::LightningAddress;
-use mostro_core::message::{Action, CantDoReason, Message, Payload};
+use mostro_core::error::{CantDoReason, MostroError, MostroError::*, ServiceError};
+use mostro_core::message::{Action, Message, Payload};
 use mostro_core::order::{Order, Status};
 use nostr::nips::nip59::UnwrappedGift;
 use nostr_sdk::prelude::*;
@@ -20,40 +21,43 @@ use std::str::FromStr;
 use tokio::sync::mpsc::channel;
 use tracing::{error, info};
 
-pub async fn check_failure_retries(order: &Order, request_id: Option<u64>) -> Result<Order> {
+/// Check if order has failed payment retries
+pub async fn check_failure_retries(
+    order: &Order,
+    request_id: Option<u64>,
+) -> Result<Order, MostroError> {
     let mut order = order.clone();
 
     // Handle to db here
-    let pool = db::connect().await?;
+    let pool = db::connect()
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
 
     // Get max number of retries
     let ln_settings = Settings::get_ln();
     let retries_number = ln_settings.payment_attempts as i64;
+    // Count payment retries up to limit
+    order.count_failed_payment(retries_number);
 
-    // Mark payment as failed
-    if !order.failed_payment {
-        order.failed_payment = true;
-        order.payment_attempts = 0;
-    } else if order.payment_attempts < retries_number {
-        order.payment_attempts += 1;
-    }
-    let buyer_pubkey = match &order.buyer_pubkey {
-        Some(buyer) => PublicKey::from_str(buyer.as_str())?,
-        None => return Err(Error::msg("Missing buyer pubkey")),
-    };
+    let buyer_pubkey = order
+        .get_buyer_pubkey()
+        .map_err(|cause| MostroInternalErr(cause))?;
 
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
         Some(order.id),
         Action::PaymentFailed,
         None,
-        &buyer_pubkey,
+        buyer_pubkey,
         None,
     )
     .await;
 
     // Update order
-    let result = order.update(&pool).await?;
+    let result = order
+        .update(&pool)
+        .await
+        .map_err(|cause| MostroInternalErr(ServiceError::DbAccessError(cause.to_string())))?;
     Ok(result)
 }
 
@@ -63,36 +67,29 @@ pub async fn release_action(
     my_keys: &Keys,
     pool: &Pool<Sqlite>,
     ln_client: &mut LndConnector,
-) -> Result<()> {
+) -> Result<(), MostroError> {
     // Get request id
     let request_id = msg.get_inner_message_kind().request_id;
-    let order_id = msg
-        .get_inner_message_kind()
-        .id
-        .ok_or(Error::msg("Order ID is required but was not provided"))?;
+    // Get order
+    let order = get_order(&msg, pool).await?;
+    // Get seller pubkey hex
+    let seller_pubkey = order
+        .get_seller_pubkey()
+        .map_err(|cause| MostroInternalErr(cause))
+        .and_then(|pk| {
+            if pk.to_string() == event.rumor.pubkey.to_string() {
+                Ok(pk)
+            } else {
+                Err(MostroCantDo(CantDoReason::InvalidPeer))
+            }
+        });
 
-    let mut order = Order::by_id(pool, order_id)
-        .await?
-        .ok_or(Error::msg(format!(
-            "Order {} not found in database",
-            order_id
-        )))?;
-
-    let seller_pubkey_hex = order.seller_pubkey.as_ref().ok_or(Error::msg(format!(
-        "Seller public key not found for order {}",
-        order_id
-    )))?;
-
-    // Only seller can release funds
-    if &event.rumor.pubkey.to_string() != seller_pubkey_hex {
-        send_cant_do_msg(
-            request_id,
-            Some(order.id),
-            Some(CantDoReason::InvalidPeer),
-            &event.rumor.pubkey,
-        )
-        .await;
-        return Ok(());
+    // Check if order is active, fiat sent or dispute
+    if order.check_status(Status::Active).is_err()
+        && order.check_status(Status::FiatSent).is_err()
+        && order.check_status(Status::Dispute).is_err()
+    {
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
     }
 
     let next_trade: Option<(String, u32)> = match event.rumor.pubkey.to_string() {
@@ -169,23 +166,26 @@ pub async fn release_action(
 
     // We send a HoldInvoicePaymentSettled message to seller, the client should
     // indicate *funds released* message to seller
-    send_new_order_msg(
+    enqueue_order_msg(
         request_id,
-        Some(order_id),
+        Some(order.id),
         Action::HoldInvoicePaymentSettled,
         None,
-        &event.rumor.pubkey,
+        seller_pubkey?,
         None,
     )
     .await;
 
-    // Send DM to seller to rate counterpart
-    send_new_order_msg(
-        request_id,
-        Some(order.id),
-        Action::Rate,
+    // We send a message to buyer indicating seller released funds
+    let buyer_pubkey = order
+        .get_buyer_pubkey()
+        .map_err(|cause| MostroInternalErr(cause))?;
+    enqueue_order_msg(
         None,
-        &event.rumor.pubkey,
+        Some(order.id),
+        Action::Released,
+        None,
+        buyer_pubkey,
         None,
     )
     .await;
@@ -290,10 +290,14 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
                                 "Order Id {}: Invoice with hash: {} paid!",
                                 order.id, msg.payment.payment_hash
                             );
-
-                            let _ =
-                                payment_success(&mut order, &buyer_pubkey, &my_keys, request_id)
-                                    .await;
+                            let _ = payment_success(
+                                &mut order,
+                                buyer_pubkey,
+                                seller_pubkey,
+                                &my_keys,
+                                request_id,
+                            )
+                            .await;
                         }
                         PaymentStatus::Failed => {
                             info!(
@@ -323,12 +327,13 @@ pub async fn do_payment(mut order: Order, request_id: Option<u64>) -> Result<()>
 
 async fn payment_success(
     order: &mut Order,
-    buyer_pubkey: &PublicKey,
+    buyer_pubkey: PublicKey,
+    seller_pubkey: PublicKey,
     my_keys: &Keys,
     request_id: Option<u64>,
 ) -> Result<()> {
     // Purchase completed message to buyer
-    send_new_order_msg(
+    enqueue_order_msg(
         None,
         Some(order.id),
         Action::PurchaseCompleted,
@@ -471,19 +476,19 @@ async fn notify_invalid_amount(order: &Order, request_id: Option<u64>) {
             }
         };
 
-        send_cant_do_msg(
+        enqueue_cant_do_msg(
             None,
             Some(order.id),
-            Some(CantDoReason::InvalidAmount),
-            &buyer_pubkey,
+            CantDoReason::InvalidAmount,
+            buyer_pubkey,
         )
         .await;
 
-        send_cant_do_msg(
+        enqueue_cant_do_msg(
             request_id,
             Some(order.id),
-            Some(CantDoReason::InvalidAmount),
-            &seller_pubkey,
+            CantDoReason::InvalidAmount,
+            seller_pubkey,
         )
         .await;
     }
